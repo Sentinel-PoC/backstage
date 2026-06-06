@@ -1,0 +1,19 @@
+# Production overrides for OKD deployment
+# This file is baked into the image but can be overridden via ConfigMap mount
+app:
+  baseUrl: https://backstage.208.haist.farm
+
+backend:
+  baseUrl: https://backstage.208.haist.farm
+  listen:
+    port: 7007
+    host: 0.0.0.0
+  cors:
+    origin: https://backstage.208.haist.farm
+  database:
+    client: pg
+    connection:
+      host: ${POSTGRES_HOST}
+      port: ${POSTGRES_PORT}
+      user: ${POSTGRES_USER}
+      password: ${POSTGRES_PASSWORD}

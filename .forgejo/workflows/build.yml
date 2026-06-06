@@ -1,0 +1,111 @@
+---
+name: Build and Deploy
+on:
+  push:
+    branches: [main]
+
+env:
+  HARBOR_REGISTRY: harbor.208.haist.farm
+  IMAGE_NAME: sentinel/backstage
+  GITOPS_DEPLOY_FILE: apps/backstage/deployment.yaml
+
+jobs:
+  build-and-push:
+    runs-on: iac-buildah
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        run: |
+          IMAGE_TAG="$(echo $GITHUB_SHA | cut -c1-7)"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "Image tag: $IMAGE_TAG"
+
+      - name: Build container image
+        run: |
+          echo "Building $HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          buildah bud --network=host -t "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Push, sign, scan, and deploy
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          FORGEJO_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Push to Harbor
+          buildah login --username "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD" "$HARBOR_REGISTRY"
+          buildah push --digestfile /tmp/digest.txt "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          DIGEST="$(cat /tmp/digest.txt)"
+          echo "Pushed with digest: $DIGEST"
+
+          # Sign image
+          # OPS-1141: --tlog-upload=false matches platform policy (no Rekor; signing is offline-only)
+          COSIGN_PASSWORD="" cosign sign --key /etc/cosign/cosign.key --tlog-upload=false -y "$HARBOR_REGISTRY/$IMAGE_NAME@$DIGEST"
+          echo "Image signed"
+
+          # Verify signature
+          # OPS-1141/OPS-1142: --insecure-ignore-tlog required because signing uses --tlog-upload=false (no Rekor entry)
+          cosign verify --insecure-ignore-tlog --key /etc/cosign/cosign.pub "$HARBOR_REGISTRY/$IMAGE_NAME@$DIGEST"
+          echo "Signature verified"
+
+          # Trivy scan (non-blocking)
+          trivy image --severity HIGH,CRITICAL --format table "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG" || true
+
+          # SBOM
+          syft "$HARBOR_REGISTRY/$IMAGE_NAME@$DIGEST" -o cyclonedx-json > /dev/null
+          echo "SBOM generated"
+
+          # OPS-1134: use the signed digest (not the tag) so the gitops ref
+          # matches Kyverno require-image-digest + stays valid after OPS-1075
+          # digest-pinning. DIGEST is already captured above from /tmp/digest.txt.
+          # The sed pattern must match both digest refs (@sha256:...) and legacy
+          # tag refs (:tag) to handle either pinning style.
+
+          # Update GitOps
+          FULL_IMAGE="$HARBOR_REGISTRY/$IMAGE_NAME@${DIGEST}"
+          echo "Updating $GITOPS_DEPLOY_FILE with image $FULL_IMAGE"
+
+          git config --global user.name "Sentinel CI"
+          git config --global user.email "ci@haist.farm"
+
+          REPO_URL="https://sentinel-worker:${FORGEJO_TOKEN}@forgejo.208.haist.farm/sentinel-admin/overwatch-gitops.git"
+          rm -rf /tmp/gitops
+          git clone --depth 1 --branch main "$REPO_URL" /tmp/gitops
+          cd /tmp/gitops
+
+          # Match both digest-pinned (@sha256:...) and tag-based (:tag) refs.
+          # Kyverno require-image-digest blocks tag-only refs in production;
+          # writing @DIGEST ensures the gitops commit passes admission.
+          sed -i "s|image: ${HARBOR_REGISTRY}/${IMAGE_NAME}[@:][^[:space:]]*|image: ${FULL_IMAGE}|" "$GITOPS_DEPLOY_FILE"
+
+          if git diff --quiet; then
+            echo "No changes — digest already up to date"
+            exit 0
+          fi
+
+          git add "$GITOPS_DEPLOY_FILE"
+          git commit -m "[ci] Update ${IMAGE_NAME} to ${DIGEST}"
+
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if git push origin main; then
+              echo "Image digest updated successfully"
+              exit 0
+            fi
+            echo "Push failed (attempt $i/$MAX_RETRIES), rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "Failed to push after $MAX_RETRIES attempts"
+          exit 1
+
+  gitleaks:
+    runs-on: iac
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gitleaks secret detection
+        run: |
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git
+          echo "No secrets detected."

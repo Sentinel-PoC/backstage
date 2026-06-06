@@ -1,0 +1,28 @@
+include:
+  - project: admin1/overwatch-gitops
+    file: /ci-templates/supply-chain-pipeline.yml
+
+variables:
+  IMAGE_NAME: sentinel/backstage
+
+# Override build-and-push: Dockerfile handles yarn install/tsc/build internally
+build-and-push:
+  stage: build
+  script:
+    - buildah login --username "$HARBOR_USERNAME" --password "$HARBOR_PASSWORD" --tls-verify=false "$HARBOR_REGISTRY"
+    - buildah bud --network=host --layers --build-arg http_proxy=http://localhost:3128 --build-arg https_proxy=http://localhost:3128 -t "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG" .
+    - buildah push --digestfile "$CI_PROJECT_DIR/digest.txt" --tls-verify=false "$HARBOR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+    - DIGEST=$(cat "$CI_PROJECT_DIR/digest.txt")
+    - echo "IMAGE_DIGEST=$DIGEST" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+update-gitops:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+        GITOPS_DEPLOY_FILE: apps/backstage/deployment.yaml
